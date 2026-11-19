@@ -855,11 +855,21 @@ export default function App() {
 
       <details className="panel">
         <summary>Аудио реплик партнёра {missingClips ? `(${PARTNER_INDEXES.length - missingClips}/${PARTNER_INDEXES.length})` : '✓'}</summary>
-        <p className="hint">Реплики Пети может записать кто угодно на своём телефоне: отправьте ему ссылку, он запишет и пришлёт файлы. Громкость выравнивается автоматически. Записи хранятся только в этом браузере.</p>
+        <p className="hint">Громкость записей выравнивается автоматически. Записи хранятся только в этом браузере.</p>
+        <button className="primary" style={{ width: '100%', marginBottom: 8 }} disabled={recording} onClick={() => { stopStream(); location.hash = '#record'; }}>🎙 Записать реплики Пети самой</button>
         <div className="row">
           <button disabled={recording} onClick={invitePartner}>📨 Пригласить партнёра</button>
-          <label className="btn primary">📥 Загрузить файлы от партнёра<input type="file" accept="audio/*,.m4a,.mp4,.webm,.ogg,.mp3,.wav" multiple hidden disabled={recording} onChange={(e) => { void uploadMany(e.target.files); e.target.value = ''; }} /></label>
+          <label className="btn">📥 Загрузить файлы от партнёра<input type="file" accept="audio/*,.m4a,.mp4,.webm,.ogg,.mp3,.wav" multiple hidden disabled={recording} onChange={(e) => { void uploadMany(e.target.files); e.target.value = ''; }} /></label>
         </div>
+        <details className="hint">
+          <summary>Как получить записи от партнёра</summary>
+          <ol style={{ paddingLeft: 18, margin: '6px 0' }}>
+            <li>Нажмите «📨 Пригласить партнёра» и отправьте ссылку в Telegram или WhatsApp.</li>
+            <li>Партнёр открывает ссылку, записывает реплики и нажимает «📤 Отправить актёру» — файлы придут вам в чат.</li>
+            <li>На iPhone: в чате откройте каждый файл → «Поделиться» → «Сохранить в Файлы».</li>
+            <li>Здесь нажмите «📥 Загрузить файлы от партнёра» и выберите все файлы сразу — они сами встанут на свои реплики.</li>
+          </ol>
+        </details>
         {PARTNER_INDEXES.map((i) => (
           <div key={i} className="clip">
             <div className="text">«{SCENE[i].text}»</div>
