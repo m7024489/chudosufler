@@ -11,7 +11,7 @@ import { Recognizer, matchLine, speechRecognitionSupported, words } from './spee
 type AudioMode = 'speaker' | 'mix';
 type PartnerSource = 'tts' | 'clips';
 type Phase = 'idle' | 'opening' | 'ready' | 'recording' | 'done';
-type AdvanceMode = 'manual' | 'speech' | 'vad';
+type AdvanceMode = 'manual' | 'speech' | 'vad' | 'timer';
 type Turn = 'idle' | 'partner' | 'actor';
 
 // Порог голоса считается от уровня фонового шума (он подстраивается сам), умноженного на чувствительность.
@@ -72,6 +72,14 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  // Отдельный AudioContext только для «слуха»: синтез речи на iPhone не должен его ломать.
+  const micCtxRef = useRef<AudioContext | null>(null);
+  const micSrcRef = useRef<{ node: MediaStreamAudioSourceNode; track: MediaStreamTrack } | null>(null);
+  const flatSinceRef = useRef(0);
+  const lastRebuildRef = useRef(0);
+  const micAliveRef = useRef(false);
+  const peakRef = useRef(0);
+  const flatRebuildsRef = useRef(0);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const mixRef = useRef<{ dest: MediaStreamAudioDestinationNode; micGain: GainNode; micSrc: MediaStreamAudioSourceNode } | null>(null);
@@ -143,8 +151,16 @@ export default function App() {
       if (a) {
         a.getByteTimeDomainData(data);
         let peak = 0;
-        for (const v of data) peak = Math.max(peak, Math.abs(v - 128));
+        let flat = true;
+        for (const v of data) { const d = Math.abs(v - 128); if (d > peak) peak = d; if (v !== 128) flat = false; }
         const lvl = peak / 128;
+        peakRef.current = lvl;
+        // Абсолютно ровный сигнал = микрофон для анализа «отвалился» (живой микрофон всегда шумит).
+        if (flat) {
+          if (!flatSinceRef.current) flatSinceRef.current = now;
+          micAliveRef.current = false;
+          if (now - flatSinceRef.current > 800 && now - lastRebuildRef.current > 2000) rebuildRef.current('цифровая тишина');
+        } else { flatSinceRef.current = 0; micAliveRef.current = true; }
         setMicLevel(lvl);
         // Фоновый шум: быстро опускаемся к тишине, медленно поднимаемся. Пока говорит партнёр — не учитываем.
         // Пока актёр говорит (уровень выше порога), шум не пересчитываем — иначе порог «уползает» вверх за голосом.
@@ -170,6 +186,36 @@ export default function App() {
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, []);
+
+  // --- «Слух»: анализатор уровня микрофона, который умеет переподключаться
+  const rebuildRef = useRef<(why: string) => void>(() => {});
+  const rebuildAnalyser = (why: string) => {
+    const s = streamRef.current;
+    const t = s?.getAudioTracks()[0];
+    if (!s || !t || t.readyState !== 'live') return;
+    lastRebuildRef.current = performance.now();
+    flatSinceRef.current = 0;
+    try { micSrcRef.current?.node.disconnect(); micSrcRef.current?.track.stop(); } catch { /* ok */ }
+    // Каждые второй и далее разы пересоздаём и сам контекст.
+    let ctx = micCtxRef.current;
+    if (why === 'цифровая тишина') flatRebuildsRef.current++; else flatRebuildsRef.current = 0;
+    // Первая попытка — новый источник в том же контексте, со второй — пересоздаём и сам контекст.
+    if (!ctx || ctx.state === 'closed' || flatRebuildsRef.current >= 2) {
+      try { ctx?.close(); } catch { /* ok */ }
+      ctx = new AudioContext();
+      micCtxRef.current = ctx;
+    }
+    ctx.resume().catch(() => {});
+    const clone = t.clone();
+    const node = ctx.createMediaStreamSource(new MediaStream([clone]));
+    const an = ctx.createAnalyser();
+    an.fftSize = 512;
+    node.connect(an);
+    micSrcRef.current = { node, track: clone };
+    analyserRef.current = an;
+    log(`Слух переподключён (${why}): AudioContext ${ctx.state}`);
+  };
+  rebuildRef.current = rebuildAnalyser;
 
   const ensureCtx = useCallback((): AudioContext => {
     if (!ctxRef.current || ctxRef.current.state === 'closed') {
@@ -238,10 +284,8 @@ export default function App() {
       }
       // AudioContext создаём ПОСЛЕ getUserMedia — на iOS так меньше проблем с частотой и маршрутом звука.
       const ctx = await resumeCtx();
-      const an = ctx.createAnalyser();
-      an.fftSize = 512;
-      ctx.createMediaStreamSource(new MediaStream(s.getAudioTracks())).connect(an);
-      analyserRef.current = an;
+      void ctx;
+      rebuildAnalyser('камера включена');
       setMicState(s.getAudioTracks()[0]?.muted ? 'заглушён системой' : 'работает');
       for (const [k, b] of Object.entries(clipBlobs)) if (!buffersRef.current[+k]) await decodeClip(+k, b);
       setPhase(result ? 'done' : 'ready');
@@ -311,6 +355,8 @@ export default function App() {
     recognizerRef.current?.newTurn();
     const ctx = ctxRef.current;
     if (ctx && ctx.state !== 'running') ctx.resume().catch(() => {});
+    // После голоса партнёра на iPhone «слух» мог отвалиться — переподключаем заранее.
+    rebuildAnalyser('начало хода актёра');
     const at = streamRef.current?.getAudioTracks()[0];
     log(`Ход актёра: AudioContext=${ctx?.state}, микрофон ${at ? `${at.readyState}${at.muted ? ', ЗАГЛУШЁН' : ''}` : 'нет'}, распознавание=${recognizerRef.current ? (recognizerRef.current.failed ? 'сломалось' : 'есть') : 'выкл'}, шум ${noiseFloorRef.current.toFixed(3)}`);
     setHeard('');
@@ -344,9 +390,11 @@ export default function App() {
     const id = setInterval(() => {
       const ctx = ctxRef.current;
       if (ctx && ctx.state !== 'running' && ctx.state !== 'closed') ctx.resume().catch(() => {});
+      const mctx = micCtxRef.current;
+      if (mctx && mctx.state !== 'running' && mctx.state !== 'closed') mctx.resume().catch(() => {});
       const now0 = performance.now();
       const ls = Math.max(lastVoiceRef.current, lastTextRef.current);
-      setDiag(`ход: ${turnRef.current} · звук: ${ctx?.state ?? '—'} · голос ${(speechMsRef.current / 1000).toFixed(1)} с · тишина ${ls ? ((now0 - ls) / 1000).toFixed(1) : '—'} с · порог ${thresholdRef.current.toFixed(3)}${recognizerRef.current ? ` · распозн.: ${recognizerRef.current.failed ? 'ошибка' : recognizerRef.current.status}` : ''}`);
+      setDiag(`ход: ${turnRef.current} · звук: ${ctx?.state ?? '—'} · слух: ${mctx?.state ?? '—'}/${micAliveRef.current ? 'живой' : 'ТИШИНА'} пик ${peakRef.current.toFixed(3)} · голос ${(speechMsRef.current / 1000).toFixed(1)} с · тишина ${ls ? ((now0 - ls) / 1000).toFixed(1) : '—'} с · порог ${thresholdRef.current.toFixed(3)}${recognizerRef.current ? ` · распозн.: ${recognizerRef.current.failed ? 'ошибка' : recognizerRef.current.status}` : ''}`);
       if (turnRef.current !== 'actor' || advancingRef.current) return;
       const s = settingsRef.current;
       const now = performance.now();
@@ -357,6 +405,12 @@ export default function App() {
       if (c >= SCENE.length) return;
       // Ожидаемая длительность реплики ~0,35 с на слово; актёр должен проговорить хотя бы половину.
       const minSpeech = Math.max(300, words(SCENE[c].text).length * 70);
+      if (s.advanceMode === 'timer') {
+        // Не зависит от микрофона: ждём примерную длительность реплики (~0,45 с на слово) + паузу.
+        const wait = words(SCENE[c].text).length * 450 + 600 + delayMs;
+        if (now - turnStartRef.current >= wait) autoAdvance('по времени');
+        return;
+      }
       const useVad = s.advanceMode === 'vad' || recognizerRef.current?.failed;
       if (!useVad) {
         if (lineDoneRef.current && silentFor >= delayMs) autoAdvance('реплика распознана');
@@ -406,6 +460,7 @@ export default function App() {
       recognizerRef.current = r;
       r.start();
     } else recognizerRef.current = null;
+    micCtxRef.current?.resume().catch(() => {});
     const ctx = await resumeCtx();
     let recStream: MediaStream;
     if (settings.audioMode === 'mix') {
@@ -547,7 +602,11 @@ export default function App() {
 
   return (
     <div className="app">
-      <div className="stage">
+      <div className="stage" onClick={() => {
+        // Касание экрана — «жест» для iPhone: будим оба звуковых контекста.
+        ctxRef.current?.resume().catch(() => {});
+        micCtxRef.current?.resume().catch(() => {});
+      }}>
         <video ref={videoRef} className={`preview ${phase === 'done' ? 'hidden' : ''}`} playsInline muted autoPlay />
         {phase === 'done' && result && (
           <video key={result.url} className="preview result" src={result.url} controls playsInline
@@ -642,6 +701,7 @@ export default function App() {
             <select value={settings.advanceMode} onChange={(e) => upd('advanceMode', e.target.value as AdvanceMode)}>
               <option value="speech" disabled={!speechRecognitionSupported()}>Авто: по распознаванию речи{speechRecognitionSupported() ? '' : ' (нет в этом браузере)'}</option>
               <option value="vad">Авто: по паузе в голосе (без распознавания)</option>
+              <option value="timer">Авто: по времени (без микрофона, запасной)</option>
               <option value="manual">Вручную, кнопкой</option>
             </select>
           </label>
