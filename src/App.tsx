@@ -1,0 +1,543 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { log, errText, logAsText, useLog } from './log';
+import { SCENE, PARTNER_INDEXES } from './scene';
+import {
+  openCamera, explainGumError, supportedVideoMimes, pickVideoMime, pickAudioMime, extForMime,
+  speak, playBuffer, VIDEO_MIME_CANDIDATES, AUDIO_MIME_CANDIDATES, isTypeSupported,
+} from './media';
+import { saveClip, deleteClip, loadClips } from './clipStore';
+
+type AudioMode = 'speaker' | 'mix';
+type PartnerSource = 'tts' | 'clips';
+type Phase = 'idle' | 'opening' | 'ready' | 'recording' | 'done';
+
+interface Settings {
+  audioMode: AudioMode;
+  partnerSource: PartnerSource;
+  echoCancellation: boolean;
+  noiseSuppression: boolean;
+  autoGainControl: boolean;
+  duckMic: boolean;
+  autoFirstLine: boolean;
+  mimeType: string; // '' = автовыбор
+  voiceName: string;
+}
+
+const DEFAULTS: Settings = {
+  audioMode: 'speaker', partnerSource: 'tts', echoCancellation: true, noiseSuppression: true,
+  autoGainControl: true, duckMic: false, autoFirstLine: true, mimeType: '', voiceName: '',
+};
+
+function loadSettings(): Settings {
+  try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('chudosufler.settings') ?? '{}') }; } catch { return DEFAULTS; }
+}
+
+interface Result { url: string; blob: Blob; mime: string; name: string; duration?: number }
+
+type Stopper = { stop: () => void } | null;
+
+export default function App() {
+  const [settings, setSettings] = useState<Settings>(loadSettings);
+  const [phase, setPhase] = useState<Phase>('idle');
+  const [error, setError] = useState<string>('');
+  const [cursor, setCursorState] = useState(0);
+  const [lastPartner, setLastPartner] = useState<number | null>(null);
+  const [partnerSpeaking, setPartnerSpeaking] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [result, setResult] = useState<Result | null>(null);
+  const [clipBlobs, setClipBlobs] = useState<Record<number, Blob>>({});
+  const [clipDur, setClipDur] = useState<Record<number, number>>({});
+  const [recordingClip, setRecordingClip] = useState<number | null>(null);
+  const [micLevel, setMicLevel] = useState(0);
+  const [micState, setMicState] = useState('нет доступа');
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [warning, setWarning] = useState('');
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const ctxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const mixRef = useRef<{ dest: MediaStreamAudioDestinationNode; micGain: GainNode; micSrc: MediaStreamAudioSourceNode } | null>(null);
+  const buffersRef = useRef<Record<number, AudioBuffer>>({});
+  const playingRef = useRef<Stopper>(null);
+  const cursorRef = useRef(0);
+  const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
+  const clipRecRef = useRef<MediaRecorder | null>(null);
+  const settingsRef = useRef(settings);
+  const recStartRef = useRef(0);
+  settingsRef.current = settings;
+
+  const setCursor = (i: number) => { cursorRef.current = i; setCursorState(i); };
+  const upd = <K extends keyof Settings>(k: K, v: Settings[K]) => setSettings((s) => ({ ...s, [k]: v }));
+
+  useEffect(() => { try { localStorage.setItem('chudosufler.settings', JSON.stringify(settings)); } catch { /* ok */ } }, [settings]);
+
+  // --- Диагностика среды при загрузке
+  useEffect(() => {
+    log(`UA: ${navigator.userAgent}`);
+    log(`isSecureContext=${window.isSecureContext}, MediaRecorder=${typeof MediaRecorder !== 'undefined'}, AudioContext=${'AudioContext' in window}, speechSynthesis=${'speechSynthesis' in window}`);
+    log(`Видео-форматы MediaRecorder: ${VIDEO_MIME_CANDIDATES.map((m) => `${m}=${isTypeSupported(m) ? 'да' : 'нет'}`).join('; ')}`);
+    log(`Аудио-форматы MediaRecorder: ${AUDIO_MIME_CANDIDATES.map((m) => `${m}=${isTypeSupported(m) ? 'да' : 'нет'}`).join('; ')}`);
+    const as = (navigator as unknown as { audioSession?: { type: string } }).audioSession;
+    log(`navigator.audioSession: ${as ? as.type : 'нет'}`);
+    if ('speechSynthesis' in window) {
+      const load = () => {
+        const v = speechSynthesis.getVoices();
+        setVoices(v.filter((x) => x.lang.toLowerCase().startsWith('ru')));
+        log(`Голоса TTS: всего ${v.length}, русских ${v.filter((x) => x.lang.toLowerCase().startsWith('ru')).length}`);
+      };
+      load();
+      speechSynthesis.addEventListener('voiceschanged', load);
+    }
+    loadClips(PARTNER_INDEXES).then((c) => {
+      setClipBlobs(c);
+      if (Object.keys(c).length) log(`Из памяти браузера загружено записей реплик: ${Object.keys(c).length}`);
+    });
+  }, []);
+
+  // --- Таймер записи
+  useEffect(() => {
+    if (phase !== 'recording') return;
+    const id = setInterval(() => setElapsed((performance.now() - recStartRef.current) / 1000), 250);
+    return () => clearInterval(id);
+  }, [phase]);
+
+  // --- Индикатор уровня микрофона
+  useEffect(() => {
+    let raf = 0;
+    const data = new Uint8Array(512);
+    const tick = () => {
+      const a = analyserRef.current;
+      if (a) {
+        a.getByteTimeDomainData(data);
+        let peak = 0;
+        for (const v of data) peak = Math.max(peak, Math.abs(v - 128));
+        setMicLevel(peak / 128);
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  const ensureCtx = useCallback((): AudioContext => {
+    if (!ctxRef.current || ctxRef.current.state === 'closed') {
+      const ctx = new AudioContext();
+      ctx.onstatechange = () => log(`AudioContext: ${ctx.state}`);
+      log(`AudioContext создан: ${ctx.sampleRate} Гц, ${ctx.state}`);
+      ctxRef.current = ctx;
+    }
+    return ctxRef.current;
+  }, []);
+
+  const resumeCtx = useCallback(async () => {
+    const ctx = ensureCtx();
+    if (ctx.state !== 'running') {
+      try { await ctx.resume(); } catch (e) { log(`ctx.resume: ${errText(e)}`, 'warn'); }
+    }
+    return ctx;
+  }, [ensureCtx]);
+
+  const decodeClip = useCallback(async (i: number, blob: Blob) => {
+    const ctx = ensureCtx();
+    try {
+      const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+      buffersRef.current[i] = buf;
+      setClipDur((d) => ({ ...d, [i]: buf.duration }));
+      log(`Реплика #${i} декодирована: ${buf.duration.toFixed(2)} с, ${blob.type || 'тип не указан'}`);
+    } catch (e) {
+      log(`Не удалось декодировать реплику #${i} (${blob.type}): ${errText(e)}`, 'error');
+    }
+  }, [ensureCtx]);
+
+  // --- Камера
+  const stopStream = () => {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    analyserRef.current = null;
+  };
+
+  const enableCamera = async () => {
+    setError('');
+    setPhase('opening');
+    stopStream();
+    try {
+      const s = await openCamera({
+        echoCancellation: settings.echoCancellation,
+        noiseSuppression: settings.noiseSuppression,
+        autoGainControl: settings.autoGainControl,
+      });
+      streamRef.current = s;
+      for (const t of s.getTracks()) {
+        t.onended = () => {
+          log(`Трек ${t.kind} завершён системой`, 'error');
+          if (t.kind === 'audio') setMicState('отключён');
+          if (recorderRef.current?.state === 'recording') setWarning(`Система остановила ${t.kind === 'audio' ? 'микрофон' : 'камеру'} во время записи.`);
+        };
+        t.onmute = () => { log(`Трек ${t.kind}: mute`, 'warn'); if (t.kind === 'audio') setMicState('заглушён системой'); };
+        t.onunmute = () => { log(`Трек ${t.kind}: unmute`); if (t.kind === 'audio') setMicState('работает'); };
+      }
+      if (videoRef.current) {
+        videoRef.current.srcObject = s;
+        await videoRef.current.play().catch((e) => log(`video.play: ${errText(e)}`, 'warn'));
+      }
+      // AudioContext создаём ПОСЛЕ getUserMedia — на iOS так меньше проблем с частотой и маршрутом звука.
+      const ctx = await resumeCtx();
+      const an = ctx.createAnalyser();
+      an.fftSize = 512;
+      ctx.createMediaStreamSource(new MediaStream(s.getAudioTracks())).connect(an);
+      analyserRef.current = an;
+      setMicState(s.getAudioTracks()[0]?.muted ? 'заглушён системой' : 'работает');
+      for (const [k, b] of Object.entries(clipBlobs)) if (!buffersRef.current[+k]) await decodeClip(+k, b);
+      setPhase(result ? 'done' : 'ready');
+    } catch (e) {
+      log(`getUserMedia: ${errText(e)}`, 'error');
+      setError(explainGumError(e));
+      setMicState('нет доступа');
+      setPhase('idle');
+    }
+  };
+
+  // --- Воспроизведение реплики партнёра
+  const playLine = async (i: number) => {
+    const s = settingsRef.current;
+    const ctx = await resumeCtx();
+    playingRef.current?.stop();
+    const mix = mixRef.current;
+    const outputs: AudioNode[] = [ctx.destination];
+    if (s.audioMode === 'mix' && mix) outputs.push(mix.dest);
+
+    const buf = buffersRef.current[i];
+    const useClip = s.partnerSource === 'clips' && buf;
+    if (s.partnerSource === 'clips' && !buf) log(`Для реплики #${i} нет аудиозаписи — использую TTS`, 'warn');
+    if (!useClip && s.audioMode === 'mix' && recorderRef.current?.state === 'recording') {
+      log('TTS нельзя подмешать в дорожку напрямую: в запись голос попадёт только через микрофон', 'warn');
+    }
+
+    setLastPartner(i);
+    setPartnerSpeaking(true);
+    if (mix && s.duckMic) mix.micGain.gain.setValueAtTime(0, ctx.currentTime);
+    const tStart = performance.now();
+    log(`▶ Партнёр, реплика #${i}: «${SCENE[i].text}» (${useClip ? 'аудиофайл' : 'TTS'}, ${s.audioMode === 'mix' ? 'микс' : 'динамик'})`);
+    const h = useClip ? playBuffer(ctx, buf, outputs) : speak(SCENE[i].text, s.voiceName || null);
+    playingRef.current = h;
+    await h.done;
+    if (playingRef.current === h) {
+      playingRef.current = null;
+      setPartnerSpeaking(false);
+      if (mix && s.duckMic) mix.micGain.gain.setValueAtTime(1, ctx.currentTime);
+      log(`■ Партнёр закончил (${((performance.now() - tStart) / 1000).toFixed(2)} с)`);
+    }
+  };
+
+  const playNextPartner = () => {
+    const i = PARTNER_INDEXES.find((p) => p >= cursorRef.current);
+    if (i === undefined) { log('Реплики партнёра закончились'); return; }
+    setCursor(i + 1);
+    void playLine(i);
+  };
+
+  const repeatPartner = () => { if (lastPartner !== null) void playLine(lastPartner); };
+
+  // --- Запись
+  const startRecording = async () => {
+    const s = streamRef.current;
+    if (!s) return;
+    setWarning('');
+    if (typeof MediaRecorder === 'undefined') { setError('MediaRecorder не поддерживается этим браузером.'); return; }
+    // iOS разрешает синтез речи только из жеста пользователя: «разблокируем» его тихой фразой прямо в обработчике нажатия,
+    // иначе первая реплика, запущенная по таймеру, может не прозвучать.
+    if (settings.partnerSource === 'tts' && 'speechSynthesis' in window) {
+      const u = new SpeechSynthesisUtterance(' ');
+      u.volume = 0;
+      speechSynthesis.speak(u);
+    }
+    const ctx = await resumeCtx();
+    let recStream: MediaStream;
+    if (settings.audioMode === 'mix') {
+      const dest = ctx.createMediaStreamDestination();
+      const micSrc = ctx.createMediaStreamSource(new MediaStream(s.getAudioTracks()));
+      const micGain = ctx.createGain();
+      micSrc.connect(micGain).connect(dest);
+      mixRef.current = { dest, micGain, micSrc };
+      recStream = new MediaStream([...s.getVideoTracks(), ...dest.stream.getAudioTracks()]);
+      log('Режим звука: микс (микрофон + голос партнёра через Web Audio)');
+    } else {
+      mixRef.current = null;
+      recStream = new MediaStream([...s.getVideoTracks(), ...s.getAudioTracks()]);
+      log('Режим звука: динамик → микрофон');
+    }
+    const mime = settings.mimeType || pickVideoMime();
+    let rec: MediaRecorder;
+    try {
+      rec = new MediaRecorder(recStream, mime ? { mimeType: mime, videoBitsPerSecond: 2_500_000, audioBitsPerSecond: 128_000 } : undefined);
+    } catch (e) {
+      log(`MediaRecorder(${mime}): ${errText(e)} — пробую без параметров`, 'warn');
+      rec = new MediaRecorder(recStream);
+    }
+    chunksRef.current = [];
+    rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
+    rec.onerror = (e) => { log(`MediaRecorder ошибка: ${errText((e as unknown as { error?: unknown }).error ?? e)}`, 'error'); setWarning('Запись прервалась с ошибкой — см. журнал.'); };
+    rec.onpause = () => log('MediaRecorder: pause', 'warn');
+    rec.onresume = () => log('MediaRecorder: resume');
+    rec.onstop = () => finalize(rec);
+    rec.start(1000);
+    recorderRef.current = rec;
+    recStartRef.current = performance.now();
+    log(`Запись началась: ${rec.mimeType || mime || 'формат по умолчанию'}`);
+    try {
+      const wl = (navigator as unknown as { wakeLock?: { request: (t: string) => Promise<{ release: () => Promise<void> }> } }).wakeLock;
+      if (wl) wakeLockRef.current = await wl.request('screen');
+    } catch (e) { log(`wakeLock: ${errText(e)}`, 'warn'); }
+    setElapsed(0);
+    setCursor(0);
+    setLastPartner(null);
+    setPhase('recording');
+    if (settings.autoFirstLine) setTimeout(() => { if (recorderRef.current?.state === 'recording') playNextPartner(); }, 1000);
+  };
+
+  const stopRecording = () => {
+    playingRef.current?.stop();
+    playingRef.current = null;
+    setPartnerSpeaking(false);
+    const r = recorderRef.current;
+    if (r && r.state !== 'inactive') r.stop();
+    wakeLockRef.current?.release().catch(() => {});
+    wakeLockRef.current = null;
+  };
+
+  const finalize = (rec: MediaRecorder) => {
+    const mime = rec.mimeType || settings.mimeType || pickVideoMime() || 'video/mp4';
+    const blob = new Blob(chunksRef.current, { type: mime.split(';')[0] });
+    const dur = (performance.now() - recStartRef.current) / 1000;
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const name = `chudosufler-${stamp}.${extForMime(mime)}`;
+    log(`Запись остановлена: ${chunksRef.current.length} фрагментов, ${(blob.size / 1024 / 1024).toFixed(2)} МБ, ~${dur.toFixed(1)} с, ${mime}`);
+    if (mixRef.current) {
+      try { mixRef.current.micSrc.disconnect(); mixRef.current.micGain.disconnect(); } catch { /* ok */ }
+      mixRef.current = null;
+    }
+    if (!blob.size) { setWarning('Видео получилось пустым (0 байт). См. журнал.'); log('Пустой результат записи', 'error'); }
+    setResult((old) => { if (old) URL.revokeObjectURL(old.url); return { url: URL.createObjectURL(blob), blob, mime, name, duration: dur }; });
+    setPhase('done');
+  };
+
+  const shareResult = async () => {
+    if (!result) return;
+    const file = new File([result.blob], result.name, { type: result.blob.type });
+    try {
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'Самопроба' });
+        log('Файл передан в «Поделиться»');
+      } else {
+        log('navigator.share с файлами не поддерживается — используйте «Скачать»', 'warn');
+        setWarning('Этот браузер не умеет «Поделиться» файлом. Нажмите «Скачать».');
+      }
+    } catch (e) { log(`share: ${errText(e)}`, 'warn'); }
+  };
+
+  const newTake = () => { setPhase(streamRef.current ? 'ready' : 'idle'); setCursor(0); setLastPartner(null); };
+
+  // --- Запись и загрузка реплик партнёра
+  const recordClip = async (i: number) => {
+    const s = streamRef.current;
+    if (!s) { setError('Сначала включите камеру и микрофон.'); return; }
+    if (clipRecRef.current?.state === 'recording') { clipRecRef.current.stop(); return; }
+    const mime = pickAudioMime();
+    const r = new MediaRecorder(new MediaStream(s.getAudioTracks()), mime ? { mimeType: mime } : undefined);
+    const parts: Blob[] = [];
+    r.ondataavailable = (e) => e.data.size && parts.push(e.data);
+    r.onstop = async () => {
+      setRecordingClip(null);
+      clipRecRef.current = null;
+      const b = new Blob(parts, { type: (r.mimeType || mime || 'audio/mp4').split(';')[0] });
+      await storeClip(i, b);
+    };
+    r.start();
+    clipRecRef.current = r;
+    setRecordingClip(i);
+    log(`Запись реплики партнёра #${i} (${r.mimeType || mime})`);
+  };
+
+  const storeClip = async (i: number, b: Blob) => {
+    setClipBlobs((c) => ({ ...c, [i]: b }));
+    try { await saveClip(i, b); } catch (e) { log(`IndexedDB: ${errText(e)}`, 'warn'); }
+    await decodeClip(i, b);
+    upd('partnerSource', 'clips');
+  };
+
+  const uploadClip = async (i: number, f: File | undefined) => {
+    if (!f) return;
+    log(`Загружен файл для реплики #${i}: ${f.name}, ${f.type}, ${(f.size / 1024).toFixed(0)} КБ`);
+    await storeClip(i, f);
+  };
+
+  const removeClip = async (i: number) => {
+    delete buffersRef.current[i];
+    setClipBlobs((c) => { const n = { ...c }; delete n[i]; return n; });
+    setClipDur((d) => { const n = { ...d }; delete n[i]; return n; });
+    try { await deleteClip(i); } catch { /* ok */ }
+  };
+
+  const logEntries = useLog();
+  const recording = phase === 'recording';
+  const camOn = phase === 'ready' || phase === 'recording' || (phase === 'done' && !!streamRef.current);
+  const nextPartner = PARTNER_INDEXES.find((p) => p >= cursor);
+  const actorLine = cursor < SCENE.length && SCENE[cursor].who === 'actor' ? SCENE[cursor] : null;
+  const missingClips = PARTNER_INDEXES.filter((i) => !clipBlobs[i]).length;
+
+  return (
+    <div className="app">
+      <div className="stage">
+        <video ref={videoRef} className={`preview ${phase === 'done' ? 'hidden' : ''}`} playsInline muted autoPlay />
+        {phase === 'done' && result && (
+          <video key={result.url} className="preview result" src={result.url} controls playsInline
+            onLoadedMetadata={(e) => log(`Плеер результата: длительность ${e.currentTarget.duration} с, ${e.currentTarget.videoWidth}×${e.currentTarget.videoHeight}`)}
+            onError={() => log('Плеер не смог открыть итоговый файл', 'error')} />
+        )}
+        {!camOn && phase !== 'done' && <div className="placeholder">Камера выключена</div>}
+        <div className="badges">
+          {recording && <span className="badge rec">● REC {fmt(elapsed)}</span>}
+          {partnerSpeaking && <span className="badge partner">🔊 Говорит партнёр</span>}
+          <span className="badge mic">
+            🎙 {micState}
+            <span className="meter"><span style={{ width: `${Math.min(100, micLevel * 140)}%` }} /></span>
+          </span>
+        </div>
+      </div>
+
+      {error && <div className="alert error">{error}</div>}
+      {warning && <div className="alert warn">{warning}</div>}
+
+      {phase !== 'done' && (
+        <div className="lines">
+          <div className="line partner">
+            <div className="who">ПЕТЯ (суфлёр){lastPartner !== null ? '' : ' — следующая'}</div>
+            <div className="text">{lastPartner !== null ? SCENE[lastPartner].text : nextPartner !== undefined ? SCENE[nextPartner].text : '—'}</div>
+          </div>
+          <div className="line actor">
+            <div className="who">МАША (вы)</div>
+            <div className="text">{actorLine ? actorLine.text : cursor >= SCENE.length ? 'Сцена окончена — нажмите «Стоп»' : '…ждём реплику партнёра'}</div>
+          </div>
+        </div>
+      )}
+
+      <div className="controls">
+        {(phase === 'idle' || phase === 'opening') && (
+          <button className="big primary" disabled={phase === 'opening'} onClick={enableCamera}>
+            {phase === 'opening' ? 'Запрашиваю доступ…' : 'Включить камеру и микрофон'}
+          </button>
+        )}
+        {phase === 'ready' && <button className="big rec" onClick={startRecording}>● Начать запись</button>}
+        {recording && (
+          <>
+            <button className="big primary" onClick={playNextPartner} disabled={nextPartner === undefined}>▶ Следующая реплика</button>
+            <div className="row">
+              <button onClick={repeatPartner} disabled={lastPartner === null}>↻ Повторить</button>
+              <button className="stop" onClick={stopRecording}>■ Стоп</button>
+            </div>
+          </>
+        )}
+        {phase === 'done' && result && (
+          <>
+            <div className="meta">{result.name} · {(result.blob.size / 1024 / 1024).toFixed(1)} МБ · {result.mime}</div>
+            <div className="row">
+              <a className="btn primary" href={result.url} download={result.name}>⬇ Скачать</a>
+              <button onClick={shareResult}>Поделиться / в Фото</button>
+            </div>
+            <button onClick={streamRef.current ? newTake : enableCamera}>Новый дубль</button>
+          </>
+        )}
+      </div>
+
+      <details className="panel" open={phase === 'idle'}>
+        <summary>Настройки эксперимента</summary>
+        <fieldset disabled={recording}>
+          <label className="field">Как голос партнёра попадает в видео
+            <select value={settings.audioMode} onChange={(e) => upd('audioMode', e.target.value as AudioMode)}>
+              <option value="speaker">Вариант 1: динамик → микрофон</option>
+              <option value="mix">Вариант 2: подмешивать в дорожку (Web Audio)</option>
+            </select>
+          </label>
+          <label className="field">Источник голоса партнёра
+            <select value={settings.partnerSource} onChange={(e) => upd('partnerSource', e.target.value as PartnerSource)}>
+              <option value="tts">Синтез речи телефона (бесплатно)</option>
+              <option value="clips">Аудиозаписи реплик {missingClips ? `(не хватает ${missingClips})` : '✓'}</option>
+            </select>
+          </label>
+          {settings.audioMode === 'mix' && settings.partnerSource === 'tts' && (
+            <p className="hint warn">Синтез речи браузера нельзя подмешать в дорожку — для варианта 2 запишите или загрузите аудио реплик ниже.</p>
+          )}
+          {settings.partnerSource === 'tts' && voices.length > 0 && (
+            <label className="field">Голос
+              <select value={settings.voiceName} onChange={(e) => upd('voiceName', e.target.value)}>
+                <option value="">Авто (первый русский)</option>
+                {voices.map((v) => <option key={v.name} value={v.name}>{v.name}</option>)}
+              </select>
+            </label>
+          )}
+          {settings.partnerSource === 'tts' && voices.length === 0 && <p className="hint warn">Русские голоса синтеза не найдены (или ещё не загрузились).</p>}
+          <Check label="Подавление эха (echoCancellation)" v={settings.echoCancellation} on={(v) => upd('echoCancellation', v)} />
+          <Check label="Шумоподавление (noiseSuppression)" v={settings.noiseSuppression} on={(v) => upd('noiseSuppression', v)} />
+          <Check label="Автоусиление (autoGainControl)" v={settings.autoGainControl} on={(v) => upd('autoGainControl', v)} />
+          {settings.audioMode === 'mix' && <Check label="Глушить микрофон в записи, пока говорит партнёр" v={settings.duckMic} on={(v) => upd('duckMic', v)} />}
+          <Check label="Первая реплика партнёра сама через 1 с после старта" v={settings.autoFirstLine} on={(v) => upd('autoFirstLine', v)} />
+          <label className="field">Формат видео
+            <select value={settings.mimeType} onChange={(e) => upd('mimeType', e.target.value)}>
+              <option value="">Авто ({pickVideoMime() || 'по умолчанию'})</option>
+              {supportedVideoMimes().map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </label>
+          {camOn && <button onClick={enableCamera}>Перезапустить камеру (применить настройки микрофона)</button>}
+        </fieldset>
+      </details>
+
+      <details className="panel">
+        <summary>Аудио реплик партнёра {missingClips ? `(${PARTNER_INDEXES.length - missingClips}/${PARTNER_INDEXES.length})` : '✓'}</summary>
+        <p className="hint">Запишите реплики Пети своим голосом (или попросите кого-то) либо загрузите готовые файлы. Хранятся только в этом браузере.</p>
+        {PARTNER_INDEXES.map((i) => (
+          <div key={i} className="clip">
+            <div className="text">«{SCENE[i].text}»</div>
+            <div className="row">
+              <button className={recordingClip === i ? 'stop' : ''} disabled={recording || !camOn || (recordingClip !== null && recordingClip !== i)} onClick={() => recordClip(i)}>
+                {recordingClip === i ? '■ Стоп' : '● Записать'}
+              </button>
+              <label className="btn">Файл…<input type="file" accept="audio/*" hidden disabled={recording} onChange={(e) => uploadClip(i, e.target.files?.[0])} /></label>
+              {clipBlobs[i] && <button disabled={recording} onClick={() => playLine(i)}>▶ {clipDur[i] ? `${clipDur[i].toFixed(1)} с` : ''}</button>}
+              {clipBlobs[i] && <button disabled={recording} onClick={() => removeClip(i)}>✕</button>}
+            </div>
+          </div>
+        ))}
+        {!camOn && <p className="hint">Чтобы записывать, сначала включите камеру и микрофон.</p>}
+      </details>
+
+      <details className="panel">
+        <summary>Журнал диагностики ({logEntries.length})</summary>
+        <div className="row">
+          <button onClick={() => navigator.clipboard?.writeText(logAsText()).then(() => log('Журнал скопирован'), (e) => log(`clipboard: ${errText(e)}`, 'warn'))}>Копировать</button>
+          <button onClick={() => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([logAsText()], { type: 'text/plain' }));
+            a.download = 'chudosufler-log.txt';
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+          }}>Скачать .txt</button>
+        </div>
+        <pre className="log">{logEntries.slice().reverse().map((e, k) => (
+          <div key={k} className={e.level}>{e.t.toFixed(2)}s {e.msg}</div>
+        ))}</pre>
+      </details>
+    </div>
+  );
+}
+
+function Check({ label, v, on }: { label: string; v: boolean; on: (v: boolean) => void }) {
+  return <label className="check"><input type="checkbox" checked={v} onChange={(e) => on(e.target.checked)} /> {label}</label>;
+}
+
+function fmt(s: number) {
+  const m = Math.floor(s / 60);
+  return `${m}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+}
