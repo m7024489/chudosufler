@@ -554,6 +554,10 @@ export default function App() {
     } catch (e) { log(`share: ${errText(e)}`, 'warn'); }
   };
 
+  const canShareFiles = (() => {
+    try { return !!navigator.canShare?.({ files: [new File([new Blob()], 'x.mp4', { type: 'video/mp4' })] }); } catch { return false; }
+  })();
+
   const newTake = () => { setPhase(streamRef.current ? 'ready' : 'idle'); setCursor(0); setLastPartner(null); };
 
   // --- Запись и загрузка реплик партнёра
@@ -690,8 +694,17 @@ export default function App() {
           <>
             <div className="meta">{result.name} · {(result.blob.size / 1024 / 1024).toFixed(1)} МБ · {result.mime}</div>
             <div className="row">
-              <a className="btn primary" href={result.url} download={result.name}>⬇ Скачать</a>
-              <button onClick={shareResult}>Поделиться / в Фото</button>
+              {canShareFiles ? (
+                <>
+                  <button className="big primary" onClick={shareResult}>📲 Сохранить в «Фото»</button>
+                </>
+              ) : (
+                <a className="btn big primary" href={result.url} download={result.name}>⬇ Скачать видео</a>
+              )}
+            </div>
+            {canShareFiles && <p className="hint">В открывшемся меню выберите «Сохранить видео» — ролик сразу окажется в «Фото». Там же можно отправить его в Telegram или WhatsApp.</p>}
+            <div className="row">
+              {canShareFiles && <a className="btn" href={result.url} download={result.name}>Скачать файлом</a>}
             </div>
             <button onClick={streamRef.current ? newTake : enableCamera}>Новый дубль</button>
           </>
