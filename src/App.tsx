@@ -6,6 +6,7 @@ import {
   speak, playBuffer, VIDEO_MIME_CANDIDATES, AUDIO_MIME_CANDIDATES, isTypeSupported,
 } from './media';
 import { saveClip, deleteClip, loadClips } from './clipStore';
+import { prepareClip, lineIndexFromName } from './audioTools';
 import { Recognizer, matchLine, speechRecognitionSupported, words } from './speech';
 
 type AudioMode = 'speaker' | 'mix';
@@ -243,7 +244,9 @@ export default function App() {
   const decodeClip = useCallback(async (i: number, blob: Blob) => {
     const ctx = ensureCtx();
     try {
-      const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+      const raw = await ctx.decodeAudioData(await blob.arrayBuffer());
+      const { buf, gain, trimmed } = prepareClip(ctx, raw);
+      log(`Реплика #${i}: громкость ×${gain.toFixed(1)}, обрезано тишины ${trimmed.toFixed(2)} с`);
       buffersRef.current[i] = buf;
       setClipDur((d) => ({ ...d, [i]: buf.duration }));
       log(`Реплика #${i} декодирована: ${buf.duration.toFixed(2)} с, ${blob.type || 'тип не указан'}`);
@@ -323,7 +326,7 @@ export default function App() {
     let h: { done: Promise<void>; stop: () => void };
     if (useClip) {
       const g = ctx.createGain();
-      g.gain.value = s.partnerVolume;
+      g.gain.value = s.partnerVolume * 1.5; // записи уже выровнены; 100% на ползунке = ×1,5
       outputs.forEach((o) => g.connect(o));
       h = playBuffer(ctx, buf, [g]);
       h.done.then(() => g.disconnect());
@@ -594,6 +597,32 @@ export default function App() {
     await storeClip(i, f);
   };
 
+  const uploadMany = async (list: FileList | null) => {
+    if (!list?.length) return;
+    const fs = Array.from(list);
+    const free = PARTNER_INDEXES.slice();
+    // Сначала раскладываем по номеру из имени файла, остальные — по порядку.
+    const plan: [number, File][] = [];
+    for (const f of fs) {
+      const n = lineIndexFromName(f.name);
+      if (n !== null && free.includes(n)) { plan.push([n, f]); free.splice(free.indexOf(n), 1); }
+    }
+    for (const f of fs) if (!plan.some(([, x]) => x === f) && free.length) plan.push([free.shift()!, f]);
+    for (const [i, f] of plan) await uploadClip(i, f);
+    setWarning('');
+    log(`Загружено файлов от партнёра: ${plan.length}`);
+  };
+
+  const invitePartner = async () => {
+    const url = `${location.origin}${location.pathname}#partner`;
+    const text = 'Привет! Озвучь, пожалуйста, реплики Пети для моей самопробы — открой ссылку на телефоне, запиши 3 фразы и нажми «Отправить актёру»:';
+    try {
+      if (navigator.share) { await navigator.share({ title: 'ЧудоСуфлёр — реплики партнёра', text, url }); return; }
+    } catch (e) { if ((e as Error).name === 'AbortError') return; }
+    try { await navigator.clipboard.writeText(`${text} ${url}`); setWarning('Ссылка для партнёра скопирована — вставьте её в мессенджер.'); }
+    catch { setWarning(`Отправьте партнёру ссылку: ${url}`); }
+  };
+
   const removeClip = async (i: number) => {
     delete buffersRef.current[i];
     setClipBlobs((c) => { const n = { ...c }; delete n[i]; return n; });
@@ -786,7 +815,11 @@ export default function App() {
 
       <details className="panel">
         <summary>Аудио реплик партнёра {missingClips ? `(${PARTNER_INDEXES.length - missingClips}/${PARTNER_INDEXES.length})` : '✓'}</summary>
-        <p className="hint">Запишите реплики Пети своим голосом (или попросите кого-то) либо загрузите готовые файлы. Хранятся только в этом браузере.</p>
+        <p className="hint">Реплики Пети может записать кто угодно на своём телефоне: отправьте ему ссылку, он запишет и пришлёт файлы. Громкость выравнивается автоматически. Записи хранятся только в этом браузере.</p>
+        <div className="row">
+          <button disabled={recording} onClick={invitePartner}>📨 Пригласить партнёра</button>
+          <label className="btn primary">📥 Загрузить файлы от партнёра<input type="file" accept="audio/*,.m4a,.mp4,.webm,.ogg,.mp3,.wav" multiple hidden disabled={recording} onChange={(e) => { void uploadMany(e.target.files); e.target.value = ''; }} /></label>
+        </div>
         {PARTNER_INDEXES.map((i) => (
           <div key={i} className="clip">
             <div className="text">«{SCENE[i].text}»</div>
