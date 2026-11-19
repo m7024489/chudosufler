@@ -763,8 +763,9 @@ export default function App() {
             <label className="field">Голос
               <select value={settings.voiceName} onChange={(e) => upd('voiceName', e.target.value)}>
                 <option value="">Авто (первый русский)</option>
-                {voices.map((v) => <option key={v.name} value={v.name}>{v.name}</option>)}
+                {voices.map((v) => <option key={v.name} value={v.name}>{v.name}{v.localService ? '' : ' (онлайн)'}</option>)}
               </select>
+              <button type="button" onClick={() => speak(SCENE[0].text, settings.voiceName || null, settings.partnerVolume)}>▶ Прослушать голос</button>
             </label>
           )}
           {settings.partnerSource === 'tts' && voices.length === 0 && <p className="hint warn">Русские голоса синтеза не найдены (или ещё не загрузились).</p>}
