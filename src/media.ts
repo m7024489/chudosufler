@@ -69,7 +69,7 @@ export function explainGumError(e: unknown): string {
   }
 }
 
-export function speak(text: string, voiceName: string | null, volume = 1): { done: Promise<void>; stop: () => void } {
+export function speak(text: string, voiceName: string | null, volume = 1, rate = 1): { done: Promise<void>; stop: () => void } {
   if (!('speechSynthesis' in window)) {
     log('speechSynthesis недоступен', 'error');
     return { done: Promise.resolve(), stop: () => {} };
@@ -80,6 +80,7 @@ export function speak(text: string, voiceName: string | null, volume = 1): { don
   const u = new SpeechSynthesisUtterance(text);
   u.lang = 'ru-RU';
   u.volume = Math.max(0, Math.min(1, volume));
+  u.rate = Math.max(0.5, Math.min(2, rate));
   const v = synth.getVoices().find((x) => x.name === voiceName) ?? synth.getVoices().find((x) => x.lang.toLowerCase().startsWith('ru'));
   if (v) u.voice = v;
   u.onstart = () => log(`TTS начал: "${text}" (${v?.name ?? 'голос по умолчанию'})`);
@@ -93,9 +94,10 @@ export function speak(text: string, voiceName: string | null, volume = 1): { don
   return { done, stop: () => { synth.cancel(); finish(); } };
 }
 
-export function playBuffer(ctx: AudioContext, buf: AudioBuffer, outputs: AudioNode[]): { done: Promise<void>; stop: () => void } {
+export function playBuffer(ctx: AudioContext, buf: AudioBuffer, outputs: AudioNode[], rate = 1): { done: Promise<void>; stop: () => void } {
   const src = ctx.createBufferSource();
   src.buffer = buf;
+  src.playbackRate.value = rate;
   outputs.forEach((o) => src.connect(o));
   let finish: () => void = () => {};
   const done = new Promise<void>((res) => { finish = res; });

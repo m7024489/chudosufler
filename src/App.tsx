@@ -32,11 +32,12 @@ interface Settings {
   replyDelay: number; // секунды тишины после реплики актёра
   partnerVolume: number; // 0.1..1
   sensitivity: 'high' | 'mid' | 'low';
+  mirror: boolean; // Петя подстраивается под темп и громкость актёра
 }
 
 const DEFAULTS: Settings = {
   audioMode: 'speaker', partnerSource: 'tts', echoCancellation: true, noiseSuppression: true,
-  autoGainControl: true, duckMic: false, autoFirstLine: true, mimeType: '', voiceName: '',
+  autoGainControl: true, duckMic: false, mirror: true, autoFirstLine: true, mimeType: '', voiceName: '',
   advanceMode: speechRecognitionSupported() ? 'speech' : 'vad', replyDelay: 1, partnerVolume: 0.6, sensitivity: 'high',
 };
 
@@ -82,6 +83,12 @@ export default function App() {
   const peakRef = useRef(0);
   const flatRebuildsRef = useRef(0);
   const needSpeechRef = useRef(0);
+  // «Реакция» партнёра: громкость и темп последней реплики актёра.
+  const loudSumRef = useRef(0);
+  const loudNRef = useRef(0);
+  const sessionLoudRef = useRef({ sum: 0, n: 0 });
+  const reactRef = useRef<{ rate: number; vol: number } | null>(null);
+  const [reactInfo, setReactInfo] = useState('');
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const mixRef = useRef<{ dest: MediaStreamAudioDestinationNode; micGain: GainNode; micSrc: MediaStreamAudioSourceNode } | null>(null);
@@ -177,6 +184,8 @@ export default function App() {
           if (lvl > thr) {
             if (!voiceSeenRef.current) { voiceSeenRef.current = true; log(`Голос актёра замечен: уровень ${lvl.toFixed(3)}, порог ${thr.toFixed(3)}`); }
             lastVoiceRef.current = now;
+            loudSumRef.current += lvl;
+            loudNRef.current++;
           }
           // «Хвост» 200 мс: паузы между слогами считаем речью.
           if (lastVoiceRef.current && now - lastVoiceRef.current < 200) speechMsRef.current += now - prevT;
@@ -323,15 +332,18 @@ export default function App() {
     const tStart = performance.now();
     log(`▶ Партнёр, реплика #${i}: «${SCENE[i].text}» (${useClip ? 'аудиофайл' : 'TTS'}, ${s.audioMode === 'mix' ? 'микс' : 'динамик'})`);
     setTurn('partner');
+    const react = s.mirror && recorderRef.current?.state === 'recording' ? reactRef.current : null;
     let h: { done: Promise<void>; stop: () => void };
     if (useClip) {
       const g = ctx.createGain();
       g.gain.value = s.partnerVolume * 1.5; // записи уже выровнены; 100% на ползунке = ×1,5
       outputs.forEach((o) => g.connect(o));
-      h = playBuffer(ctx, buf, [g]);
+      if (react) g.gain.value *= react.vol;
+      // Для записанного голоса темп меняем осторожно: вместе с ним меняется высота голоса.
+      h = playBuffer(ctx, buf, [g], react ? Math.max(0.92, Math.min(1.1, react.rate)) : 1);
       h.done.then(() => g.disconnect());
     } else {
-      h = speak(SCENE[i].text, s.voiceName || null, s.partnerVolume);
+      h = speak(SCENE[i].text, s.voiceName || null, s.partnerVolume * (react?.vol ?? 1), react?.rate ?? 1);
     }
     playingRef.current = h;
     await h.done;
@@ -353,6 +365,8 @@ export default function App() {
     lastVoiceRef.current = 0;
     lastTextRef.current = 0;
     speechMsRef.current = 0;
+    loudSumRef.current = 0;
+    loudNRef.current = 0;
     lineDoneRef.current = false;
     advancingRef.current = false;
     voiceSeenRef.current = false;
@@ -433,7 +447,29 @@ export default function App() {
     return () => clearInterval(id);
   }, [phase, settings.advanceMode]);
 
+  // Снимок того, КАК актёр сказал реплику: темп (слов в секунду звучания) и громкость относительно его же среднего.
+  const snapshotReaction = () => {
+    const c = cursorRef.current;
+    if (turnRef.current !== 'actor' || c >= SCENE.length || SCENE[c].who !== 'actor') return;
+    const secs = speechMsRef.current / 1000;
+    if (secs < 0.3 || loudNRef.current < 5) { reactRef.current = null; return; }
+    const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+    const wps = words(SCENE[c].text).length / secs;
+    // Отражаем темп не полностью (на 70%), чтобы Петя не «передразнивал».
+    const rate = clamp(1 + (wps / 2.6 - 1) * 0.7, 0.8, 1.25);
+    const loud = loudSumRef.current / loudNRef.current;
+    const sl = sessionLoudRef.current;
+    const vol = sl.n ? clamp(1 + (loud / (sl.sum / sl.n) - 1) * 0.8, 0.65, 1.35) : 1;
+    sl.sum += loud;
+    sl.n++;
+    reactRef.current = { rate, vol };
+    const info = `темп ×${rate.toFixed(2)} (${wps.toFixed(1)} сл/с), громкость ×${vol.toFixed(2)}`;
+    setReactInfo(info);
+    log(`Реакция партнёра: ${info}`);
+  };
+
   const playNextPartner = () => {
+    snapshotReaction();
     const i = PARTNER_INDEXES.find((p) => p >= cursorRef.current);
     if (i === undefined) { log('Реплики партнёра закончились'); return; }
     setCursor(i + 1);
@@ -508,6 +544,9 @@ export default function App() {
     setElapsed(0);
     setCursor(0);
     setLastPartner(null);
+    reactRef.current = null;
+    sessionLoudRef.current = { sum: 0, n: 0 };
+    setReactInfo('');
     setPhase('recording');
     setTurn('idle');
     if (SCENE[0].who === 'actor') beginActorTurn();
@@ -689,7 +728,7 @@ export default function App() {
             <div className="who">ПЕТЯ (суфлёр){lastPartner !== null ? '' : ' — следующая'}</div>
             <div className="text">{lastPartner !== null ? SCENE[lastPartner].text : nextPartner !== undefined ? SCENE[nextPartner].text : '—'}</div>
           </div>
-          {recording && settings.advanceMode !== 'manual' && <div className="diag">{diag}</div>}
+          {recording && settings.advanceMode !== 'manual' && <div className="diag">{diag}{settings.mirror && reactInfo ? ` · Петя: ${reactInfo}` : ''}</div>}
           {recording && turn === 'actor' && heard && settings.advanceMode === 'speech' && (
             <div className="heard">Слышу: {heard}</div>
           )}
@@ -802,6 +841,7 @@ export default function App() {
           <Check label="Шумоподавление (noiseSuppression)" v={settings.noiseSuppression} on={(v) => upd('noiseSuppression', v)} />
           <Check label="Автоусиление (autoGainControl)" v={settings.autoGainControl} on={(v) => upd('autoGainControl', v)} />
           {settings.audioMode === 'mix' && <Check label="Глушить микрофон в записи, пока говорит партнёр" v={settings.duckMic} on={(v) => upd('duckMic', v)} />}
+          <Check label="Петя подстраивается под мой темп и громкость" v={settings.mirror} on={(v) => upd('mirror', v)} />
           <Check label="Первая реплика партнёра сама через 1 с после старта" v={settings.autoFirstLine} on={(v) => upd('autoFirstLine', v)} />
           <label className="field">Формат видео
             <select value={settings.mimeType} onChange={(e) => upd('mimeType', e.target.value)}>
