@@ -147,9 +147,10 @@ export default function App() {
         const lvl = peak / 128;
         setMicLevel(lvl);
         // Фоновый шум: быстро опускаемся к тишине, медленно поднимаемся. Пока говорит партнёр — не учитываем.
-        if (turnRef.current !== 'partner') {
+        // Пока актёр говорит (уровень выше порога), шум не пересчитываем — иначе порог «уползает» вверх за голосом.
+        if (turnRef.current !== 'partner' && lvl < thresholdRef.current) {
           const f = noiseFloorRef.current;
-          noiseFloorRef.current = lvl < f ? f * 0.9 + lvl * 0.1 : f * 0.998 + lvl * 0.002;
+          noiseFloorRef.current = lvl < f ? f * 0.9 + lvl * 0.1 : f * 0.9995 + lvl * 0.0005;
         }
         const thr = Math.min(0.15, Math.max(0.015, noiseFloorRef.current * SENS[settingsRef.current.sensitivity]));
         thresholdRef.current = thr;
@@ -355,7 +356,7 @@ export default function App() {
       const c = cursorRef.current;
       if (c >= SCENE.length) return;
       // Ожидаемая длительность реплики ~0,35 с на слово; актёр должен проговорить хотя бы половину.
-      const minSpeech = Math.max(400, words(SCENE[c].text).length * 130);
+      const minSpeech = Math.max(300, words(SCENE[c].text).length * 70);
       const useVad = s.advanceMode === 'vad' || recognizerRef.current?.failed;
       if (!useVad) {
         if (lineDoneRef.current && silentFor >= delayMs) autoAdvance('реплика распознана');
@@ -363,6 +364,9 @@ export default function App() {
         else if (!lastTextRef.current && speechMsRef.current >= minSpeech && silentFor >= delayMs + 1000) autoAdvance('распознавание молчит, сработала пауза');
       } else if (speechMsRef.current >= minSpeech && silentFor >= delayMs) {
         autoAdvance('пауза в голосе');
+      } else if (speechMsRef.current >= 200 && silentFor >= delayMs + 1500) {
+        // Страховка: голос был, но тихий — после долгой тишины всё равно отвечаем.
+        autoAdvance('долгая тишина после голоса');
       }
     }, 100);
     return () => clearInterval(id);
