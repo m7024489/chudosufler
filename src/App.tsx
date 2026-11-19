@@ -80,6 +80,7 @@ export default function App() {
   const micAliveRef = useRef(false);
   const peakRef = useRef(0);
   const flatRebuildsRef = useRef(0);
+  const needSpeechRef = useRef(0);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const mixRef = useRef<{ dest: MediaStreamAudioDestinationNode; micGain: GainNode; micSrc: MediaStreamAudioSourceNode } | null>(null);
@@ -394,7 +395,7 @@ export default function App() {
       if (mctx && mctx.state !== 'running' && mctx.state !== 'closed') mctx.resume().catch(() => {});
       const now0 = performance.now();
       const ls = Math.max(lastVoiceRef.current, lastTextRef.current);
-      setDiag(`ход: ${turnRef.current} · звук: ${ctx?.state ?? '—'} · слух: ${mctx?.state ?? '—'}/${micAliveRef.current ? 'живой' : 'ТИШИНА'} пик ${peakRef.current.toFixed(3)} · голос ${(speechMsRef.current / 1000).toFixed(1)} с · тишина ${ls ? ((now0 - ls) / 1000).toFixed(1) : '—'} с · порог ${thresholdRef.current.toFixed(3)}${recognizerRef.current ? ` · распозн.: ${recognizerRef.current.failed ? 'ошибка' : recognizerRef.current.status}` : ''}`);
+      setDiag(`ход: ${turnRef.current} · звук: ${ctx?.state ?? '—'} · слух: ${mctx?.state ?? '—'}/${micAliveRef.current ? 'живой' : 'ТИШИНА'} пик ${peakRef.current.toFixed(3)} · голос ${(speechMsRef.current / 1000).toFixed(1)} из ${(needSpeechRef.current / 1000).toFixed(1)} с · тишина ${ls ? ((now0 - ls) / 1000).toFixed(1) : '—'} с · порог ${thresholdRef.current.toFixed(3)}${recognizerRef.current ? ` · распозн.: ${recognizerRef.current.failed ? 'ошибка' : recognizerRef.current.status}` : ''}`);
       if (turnRef.current !== 'actor' || advancingRef.current) return;
       const s = settingsRef.current;
       const now = performance.now();
@@ -404,7 +405,10 @@ export default function App() {
       const c = cursorRef.current;
       if (c >= SCENE.length) return;
       // Ожидаемая длительность реплики ~0,35 с на слово; актёр должен проговорить хотя бы половину.
-      const minSpeech = Math.max(300, words(SCENE[c].text).length * 70);
+      // Ожидаемое время звучания реплики: ~0,33 с на слово. Пока не проговорено ≥60% — это пауза ВНУТРИ реплики, ждём.
+      const estMs = words(SCENE[c].text).length * 330;
+      const minSpeech = Math.max(400, estMs * 0.6);
+      needSpeechRef.current = minSpeech;
       if (s.advanceMode === 'timer') {
         // Не зависит от микрофона: ждём примерную длительность реплики (~0,45 с на слово) + паузу.
         const wait = words(SCENE[c].text).length * 450 + 600 + delayMs;
@@ -418,7 +422,7 @@ export default function App() {
         else if (!lastTextRef.current && speechMsRef.current >= minSpeech && silentFor >= delayMs + 1000) autoAdvance('распознавание молчит, сработала пауза');
       } else if (speechMsRef.current >= minSpeech && silentFor >= delayMs) {
         autoAdvance('пауза в голосе');
-      } else if (speechMsRef.current >= 200 && silentFor >= delayMs + 1500) {
+      } else if (speechMsRef.current >= estMs * 0.35 && silentFor >= delayMs + 3000) {
         // Страховка: голос был, но тихий — после долгой тишины всё равно отвечаем.
         autoAdvance('долгая тишина после голоса');
       }
@@ -711,6 +715,7 @@ export default function App() {
                 <option value={0.5}>0,5 с</option>
                 <option value={1}>1 с</option>
                 <option value={2}>2 с</option>
+                <option value={3}>3 с</option>
               </select>
             </label>
           )}
