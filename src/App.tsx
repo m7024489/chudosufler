@@ -14,7 +14,8 @@ type Phase = 'idle' | 'opening' | 'ready' | 'recording' | 'done';
 type AdvanceMode = 'manual' | 'speech' | 'vad';
 type Turn = 'idle' | 'partner' | 'actor';
 
-const VOICE_THRESHOLD = 0.1; // пиковый уровень микрофона, выше которого считаем, что актёр говорит
+// Порог голоса считается от уровня фонового шума (он подстраивается сам), умноженного на чувствительность.
+const SENS: Record<string, number> = { high: 2, mid: 3, low: 4.5 };
 
 interface Settings {
   audioMode: AudioMode;
@@ -29,12 +30,13 @@ interface Settings {
   advanceMode: AdvanceMode;
   replyDelay: number; // секунды тишины после реплики актёра
   partnerVolume: number; // 0.1..1
+  sensitivity: 'high' | 'mid' | 'low';
 }
 
 const DEFAULTS: Settings = {
   audioMode: 'speaker', partnerSource: 'tts', echoCancellation: true, noiseSuppression: true,
   autoGainControl: true, duckMic: false, autoFirstLine: true, mimeType: '', voiceName: '',
-  advanceMode: speechRecognitionSupported() ? 'speech' : 'vad', replyDelay: 1, partnerVolume: 0.6,
+  advanceMode: speechRecognitionSupported() ? 'speech' : 'vad', replyDelay: 1, partnerVolume: 0.6, sensitivity: 'high',
 };
 
 function loadSettings(): Settings {
@@ -89,6 +91,10 @@ export default function App() {
   const speechMsRef = useRef(0);
   const lineDoneRef = useRef(false);
   const advancingRef = useRef(false);
+  const noiseFloorRef = useRef(0.02);
+  const thresholdRef = useRef(0.05);
+  const voiceSeenRef = useRef(false);
+  const [diag, setDiag] = useState('');
   const setTurn = (t: Turn) => { turnRef.current = t; setTurnState(t); };
 
   const setCursor = (i: number) => { cursorRef.current = i; setCursorState(i); };
@@ -138,11 +144,23 @@ export default function App() {
         a.getByteTimeDomainData(data);
         let peak = 0;
         for (const v of data) peak = Math.max(peak, Math.abs(v - 128));
-        setMicLevel(peak / 128);
-        // Детектор голоса: считаем только во время хода актёра (голос партнёра из динамика не в счёт).
-        if (turnRef.current === 'actor' && now - turnStartRef.current > 300 && peak / 128 > VOICE_THRESHOLD) {
-          lastVoiceRef.current = now;
-          speechMsRef.current += now - prevT;
+        const lvl = peak / 128;
+        setMicLevel(lvl);
+        // Фоновый шум: быстро опускаемся к тишине, медленно поднимаемся. Пока говорит партнёр — не учитываем.
+        if (turnRef.current !== 'partner') {
+          const f = noiseFloorRef.current;
+          noiseFloorRef.current = lvl < f ? f * 0.9 + lvl * 0.1 : f * 0.998 + lvl * 0.002;
+        }
+        const thr = Math.min(0.15, Math.max(0.015, noiseFloorRef.current * SENS[settingsRef.current.sensitivity]));
+        thresholdRef.current = thr;
+        // Детектор голоса: только во время хода актёра (голос партнёра из динамика не в счёт).
+        if (turnRef.current === 'actor' && now - turnStartRef.current > 300) {
+          if (lvl > thr) {
+            if (!voiceSeenRef.current) { voiceSeenRef.current = true; log(`Голос актёра замечен: уровень ${lvl.toFixed(3)}, порог ${thr.toFixed(3)}`); }
+            lastVoiceRef.current = now;
+          }
+          // «Хвост» 200 мс: паузы между слогами считаем речью.
+          if (lastVoiceRef.current && now - lastVoiceRef.current < 200) speechMsRef.current += now - prevT;
         }
       }
       prevT = now;
@@ -155,7 +173,11 @@ export default function App() {
   const ensureCtx = useCallback((): AudioContext => {
     if (!ctxRef.current || ctxRef.current.state === 'closed') {
       const ctx = new AudioContext();
-      ctx.onstatechange = () => log(`AudioContext: ${ctx.state}`);
+      ctx.onstatechange = () => {
+        log(`AudioContext: ${ctx.state}`, ctx.state === 'running' ? 'info' : 'warn');
+        // iPhone «усыпляет» звук страницы на время синтеза речи — сразу будим обратно.
+        if (ctx.state !== 'running' && ctx.state !== 'closed') ctx.resume().catch(() => {});
+      };
       log(`AudioContext создан: ${ctx.sampleRate} Гц, ${ctx.state}`);
       ctxRef.current = ctx;
     }
@@ -284,7 +306,12 @@ export default function App() {
     speechMsRef.current = 0;
     lineDoneRef.current = false;
     advancingRef.current = false;
+    voiceSeenRef.current = false;
     recognizerRef.current?.newTurn();
+    const ctx = ctxRef.current;
+    if (ctx && ctx.state !== 'running') ctx.resume().catch(() => {});
+    const at = streamRef.current?.getAudioTracks()[0];
+    log(`Ход актёра: AudioContext=${ctx?.state}, микрофон ${at ? `${at.readyState}${at.muted ? ', ЗАГЛУШЁН' : ''}` : 'нет'}, распознавание=${recognizerRef.current ? (recognizerRef.current.failed ? 'сломалось' : 'есть') : 'выкл'}, шум ${noiseFloorRef.current.toFixed(3)}`);
     setHeard('');
     setMatched(words(SCENE[c].text).map(() => false));
   };
@@ -314,6 +341,11 @@ export default function App() {
   useEffect(() => {
     if (phase !== 'recording' || settings.advanceMode === 'manual') return;
     const id = setInterval(() => {
+      const ctx = ctxRef.current;
+      if (ctx && ctx.state !== 'running' && ctx.state !== 'closed') ctx.resume().catch(() => {});
+      const now0 = performance.now();
+      const ls = Math.max(lastVoiceRef.current, lastTextRef.current);
+      setDiag(`ход: ${turnRef.current} · звук: ${ctx?.state ?? '—'} · голос ${(speechMsRef.current / 1000).toFixed(1)} с · тишина ${ls ? ((now0 - ls) / 1000).toFixed(1) : '—'} с · порог ${thresholdRef.current.toFixed(3)}${recognizerRef.current ? ` · распозн.: ${recognizerRef.current.failed ? 'ошибка' : recognizerRef.current.status}` : ''}`);
       if (turnRef.current !== 'actor' || advancingRef.current) return;
       const s = settingsRef.current;
       const now = performance.now();
@@ -323,12 +355,12 @@ export default function App() {
       const c = cursorRef.current;
       if (c >= SCENE.length) return;
       // Ожидаемая длительность реплики ~0,35 с на слово; актёр должен проговорить хотя бы половину.
-      const minSpeech = Math.max(500, words(SCENE[c].text).length * 350 * 0.5);
+      const minSpeech = Math.max(400, words(SCENE[c].text).length * 130);
       const useVad = s.advanceMode === 'vad' || recognizerRef.current?.failed;
       if (!useVad) {
         if (lineDoneRef.current && silentFor >= delayMs) autoAdvance('реплика распознана');
         // Страховка: распознавание ничего не прислало за весь ход, но голос был и долго тихо.
-        else if (!lastTextRef.current && speechMsRef.current >= minSpeech && silentFor >= delayMs + 1500) autoAdvance('распознавание молчит, сработала пауза');
+        else if (!lastTextRef.current && speechMsRef.current >= minSpeech && silentFor >= delayMs + 1000) autoAdvance('распознавание молчит, сработала пауза');
       } else if (speechMsRef.current >= minSpeech && silentFor >= delayMs) {
         autoAdvance('пауза в голосе');
       }
@@ -525,7 +557,9 @@ export default function App() {
           {recording && turn === 'actor' && <span className="badge listen">👂 Слушаю{settings.advanceMode === 'manual' ? '' : settings.advanceMode === 'vad' || srFailed ? ' (по паузе)' : ''}</span>}
           <span className="badge mic">
             🎙 {micState}
-            <span className="meter"><span style={{ width: `${Math.min(100, micLevel * 140)}%` }} /></span>
+            <span className="meter">
+              <span style={{ width: `${Math.min(100, micLevel * 300)}%`, background: micLevel > thresholdRef.current ? '#3fb950' : '#6e7681' }} />
+            </span>
           </span>
         </div>
         {recording && (
@@ -555,6 +589,7 @@ export default function App() {
             <div className="who">ПЕТЯ (суфлёр){lastPartner !== null ? '' : ' — следующая'}</div>
             <div className="text">{lastPartner !== null ? SCENE[lastPartner].text : nextPartner !== undefined ? SCENE[nextPartner].text : '—'}</div>
           </div>
+          {recording && settings.advanceMode !== 'manual' && <div className="diag">{diag}</div>}
           {recording && turn === 'actor' && heard && settings.advanceMode === 'speech' && (
             <div className="heard">Слышу: {heard}</div>
           )}
@@ -618,6 +653,15 @@ export default function App() {
           <label className="field">Громкость партнёра: {Math.round(settings.partnerVolume * 100)}%
             <input type="range" min={0.1} max={1} step={0.05} value={settings.partnerVolume} onChange={(e) => upd('partnerVolume', Number(e.target.value))} />
           </label>
+          {settings.advanceMode !== 'manual' && (
+            <label className="field">Чувствительность к голосу
+              <select value={settings.sensitivity} onChange={(e) => upd('sensitivity', e.target.value as Settings['sensitivity'])}>
+                <option value="high">Высокая (телефон далеко, тихий голос)</option>
+                <option value="mid">Средняя</option>
+                <option value="low">Низкая (шумно вокруг)</option>
+              </select>
+            </label>
+          )}
           <label className="field">Как голос партнёра попадает в видео
             <select value={settings.audioMode} onChange={(e) => upd('audioMode', e.target.value as AudioMode)}>
               <option value="speaker">Вариант 1: динамик → микрофон</option>

@@ -73,6 +73,7 @@ export class Recognizer {
   private sessionText = '';  // текст текущей сессии с начала хода
   private carry = '';        // текст хода из прошлых сессий (распознавание иногда перезапускается)
   failed = false;
+  status = 'старт';
   onText: (text: string) => void = () => {};
   onFatal: (code: string) => void = () => {};
 
@@ -88,9 +89,10 @@ export class Recognizer {
       r.continuous = true;
       r.interimResults = true;
       r.maxAlternatives = 1;
-      r.onstart = () => { this.running = true; this.base = 0; this.lastLen = 0; log('Распознавание: запущено'); };
+      r.onstart = () => { this.status = 'слушает'; this.running = true; this.base = 0; this.lastLen = 0; log('Распознавание: запущено'); };
       r.onresult = (e) => {
         this.lastLen = e.results.length;
+        this.status = `слышит (${e.results.length})`;
         const parts: string[] = [];
         for (let i = this.base; i < e.results.length; i++) parts.push(e.results[i][0].transcript);
         this.sessionText = parts.join(' ');
@@ -99,7 +101,8 @@ export class Recognizer {
       r.onerror = (e) => {
         if (e.error === 'no-speech' || e.error === 'aborted') return;
         log(`Распознавание: ошибка ${e.error}`, 'warn');
-        if (['not-allowed', 'service-not-allowed', 'audio-capture', 'language-not-supported'].includes(e.error)) {
+        this.status = `ошибка ${e.error}`;
+        if (['not-allowed', 'service-not-allowed', 'audio-capture', 'language-not-supported', 'network'].includes(e.error)) {
           this.failed = true;
           this.wanted = false;
           this.onFatal(e.error);
@@ -107,6 +110,7 @@ export class Recognizer {
       };
       r.onend = () => {
         this.running = false;
+        this.status = 'перезапуск';
         this.carry = this.text();
         this.sessionText = '';
         if (this.wanted) {

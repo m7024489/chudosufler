@@ -60,3 +60,4 @@ select { font: inherit; padding: 10px; border-radius: 8px; background: #2c2c2e; 
 .p-actor .said { color: #7ee787; }
 .heard { font-size: 13px; color: #8b949e; padding: 0 4px; }
 input[type=range] { width: 100%; }
+.diag { font: 12px/1.3 ui-monospace, Menlo, monospace; color: #e3b341; background: #1c1c1e; border-radius: 8px; padding: 6px 8px; }
