@@ -6,10 +6,15 @@ import {
   speak, playBuffer, VIDEO_MIME_CANDIDATES, AUDIO_MIME_CANDIDATES, isTypeSupported,
 } from './media';
 import { saveClip, deleteClip, loadClips } from './clipStore';
+import { Recognizer, matchLine, speechRecognitionSupported, words } from './speech';
 
 type AudioMode = 'speaker' | 'mix';
 type PartnerSource = 'tts' | 'clips';
 type Phase = 'idle' | 'opening' | 'ready' | 'recording' | 'done';
+type AdvanceMode = 'manual' | 'speech' | 'vad';
+type Turn = 'idle' | 'partner' | 'actor';
+
+const VOICE_THRESHOLD = 0.1; // пиковый уровень микрофона, выше которого считаем, что актёр говорит
 
 interface Settings {
   audioMode: AudioMode;
@@ -21,11 +26,15 @@ interface Settings {
   autoFirstLine: boolean;
   mimeType: string; // '' = автовыбор
   voiceName: string;
+  advanceMode: AdvanceMode;
+  replyDelay: number; // секунды тишины после реплики актёра
+  partnerVolume: number; // 0.1..1
 }
 
 const DEFAULTS: Settings = {
   audioMode: 'speaker', partnerSource: 'tts', echoCancellation: true, noiseSuppression: true,
   autoGainControl: true, duckMic: false, autoFirstLine: true, mimeType: '', voiceName: '',
+  advanceMode: speechRecognitionSupported() ? 'speech' : 'vad', replyDelay: 1, partnerVolume: 0.6,
 };
 
 function loadSettings(): Settings {
@@ -52,6 +61,10 @@ export default function App() {
   const [micState, setMicState] = useState('нет доступа');
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [warning, setWarning] = useState('');
+  const [turn, setTurnState] = useState<Turn>('idle');
+  const [heard, setHeard] = useState('');
+  const [matched, setMatched] = useState<boolean[]>([]);
+  const [srFailed, setSrFailed] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -68,6 +81,15 @@ export default function App() {
   const settingsRef = useRef(settings);
   const recStartRef = useRef(0);
   settingsRef.current = settings;
+  const turnRef = useRef<Turn>('idle');
+  const recognizerRef = useRef<Recognizer | null>(null);
+  const turnStartRef = useRef(0);
+  const lastVoiceRef = useRef(0);
+  const lastTextRef = useRef(0);
+  const speechMsRef = useRef(0);
+  const lineDoneRef = useRef(false);
+  const advancingRef = useRef(false);
+  const setTurn = (t: Turn) => { turnRef.current = t; setTurnState(t); };
 
   const setCursor = (i: number) => { cursorRef.current = i; setCursorState(i); };
   const upd = <K extends keyof Settings>(k: K, v: Settings[K]) => setSettings((s) => ({ ...s, [k]: v }));
@@ -108,14 +130,22 @@ export default function App() {
   useEffect(() => {
     let raf = 0;
     const data = new Uint8Array(512);
+    let prevT = performance.now();
     const tick = () => {
       const a = analyserRef.current;
+      const now = performance.now();
       if (a) {
         a.getByteTimeDomainData(data);
         let peak = 0;
         for (const v of data) peak = Math.max(peak, Math.abs(v - 128));
         setMicLevel(peak / 128);
+        // Детектор голоса: считаем только во время хода актёра (голос партнёра из динамика не в счёт).
+        if (turnRef.current === 'actor' && now - turnStartRef.current > 300 && peak / 128 > VOICE_THRESHOLD) {
+          lastVoiceRef.current = now;
+          speechMsRef.current += now - prevT;
+        }
       }
+      prevT = now;
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -221,7 +251,17 @@ export default function App() {
     if (mix && s.duckMic) mix.micGain.gain.setValueAtTime(0, ctx.currentTime);
     const tStart = performance.now();
     log(`▶ Партнёр, реплика #${i}: «${SCENE[i].text}» (${useClip ? 'аудиофайл' : 'TTS'}, ${s.audioMode === 'mix' ? 'микс' : 'динамик'})`);
-    const h = useClip ? playBuffer(ctx, buf, outputs) : speak(SCENE[i].text, s.voiceName || null);
+    setTurn('partner');
+    let h: { done: Promise<void>; stop: () => void };
+    if (useClip) {
+      const g = ctx.createGain();
+      g.gain.value = s.partnerVolume;
+      outputs.forEach((o) => g.connect(o));
+      h = playBuffer(ctx, buf, [g]);
+      h.done.then(() => g.disconnect());
+    } else {
+      h = speak(SCENE[i].text, s.voiceName || null, s.partnerVolume);
+    }
     playingRef.current = h;
     await h.done;
     if (playingRef.current === h) {
@@ -229,8 +269,72 @@ export default function App() {
       setPartnerSpeaking(false);
       if (mix && s.duckMic) mix.micGain.gain.setValueAtTime(1, ctx.currentTime);
       log(`■ Партнёр закончил (${((performance.now() - tStart) / 1000).toFixed(2)} с)`);
+      beginActorTurn();
     }
   };
+
+  // --- Ход актёра и автоматический переход
+  const beginActorTurn = () => {
+    const c = cursorRef.current;
+    if (recorderRef.current?.state !== 'recording' || c >= SCENE.length || SCENE[c].who !== 'actor') { setTurn('idle'); return; }
+    setTurn('actor');
+    turnStartRef.current = performance.now();
+    lastVoiceRef.current = 0;
+    lastTextRef.current = 0;
+    speechMsRef.current = 0;
+    lineDoneRef.current = false;
+    advancingRef.current = false;
+    recognizerRef.current?.newTurn();
+    setHeard('');
+    setMatched(words(SCENE[c].text).map(() => false));
+  };
+
+  const onRecognized = (text: string) => {
+    if (turnRef.current !== 'actor' || performance.now() - turnStartRef.current < 300) return;
+    const c = cursorRef.current;
+    if (c >= SCENE.length) return;
+    lastTextRef.current = performance.now();
+    const p = matchLine(SCENE[c].text, text);
+    setHeard(text);
+    setMatched(p.matched);
+    if (p.done && !lineDoneRef.current) {
+      lineDoneRef.current = true;
+      log(`Реплика актёра распознана: «${text}» (совпадение ${(p.coverage * 100).toFixed(0)}%)`);
+    }
+  };
+
+  const autoAdvance = (why: string) => {
+    if (advancingRef.current) return;
+    advancingRef.current = true;
+    const waited = (performance.now() - Math.max(lastVoiceRef.current, lastTextRef.current)) / 1000;
+    log(`Авто-переход: ${why}, пауза после голоса ${waited.toFixed(2)} с`);
+    playNextPartner();
+  };
+
+  useEffect(() => {
+    if (phase !== 'recording' || settings.advanceMode === 'manual') return;
+    const id = setInterval(() => {
+      if (turnRef.current !== 'actor' || advancingRef.current) return;
+      const s = settingsRef.current;
+      const now = performance.now();
+      const delayMs = s.replyDelay * 1000;
+      const lastSound = Math.max(lastVoiceRef.current, lastTextRef.current);
+      const silentFor = lastSound ? now - lastSound : 0;
+      const c = cursorRef.current;
+      if (c >= SCENE.length) return;
+      // Ожидаемая длительность реплики ~0,35 с на слово; актёр должен проговорить хотя бы половину.
+      const minSpeech = Math.max(500, words(SCENE[c].text).length * 350 * 0.5);
+      const useVad = s.advanceMode === 'vad' || recognizerRef.current?.failed;
+      if (!useVad) {
+        if (lineDoneRef.current && silentFor >= delayMs) autoAdvance('реплика распознана');
+        // Страховка: распознавание ничего не прислало за весь ход, но голос был и долго тихо.
+        else if (!lastTextRef.current && speechMsRef.current >= minSpeech && silentFor >= delayMs + 1500) autoAdvance('распознавание молчит, сработала пауза');
+      } else if (speechMsRef.current >= minSpeech && silentFor >= delayMs) {
+        autoAdvance('пауза в голосе');
+      }
+    }, 100);
+    return () => clearInterval(id);
+  }, [phase, settings.advanceMode]);
 
   const playNextPartner = () => {
     const i = PARTNER_INDEXES.find((p) => p >= cursorRef.current);
@@ -254,6 +358,18 @@ export default function App() {
       u.volume = 0;
       speechSynthesis.speak(u);
     }
+    if (settings.advanceMode === 'speech') {
+      // Запускаем прямо из нажатия: на iPhone распознавание без жеста может не стартовать.
+      const r = new Recognizer();
+      r.onText = onRecognized;
+      r.onFatal = (code) => {
+        setSrFailed(true);
+        log(`Распознавание недоступно (${code}) — перехожу на авто-переход «по паузе»`, 'warn');
+      };
+      setSrFailed(false);
+      recognizerRef.current = r;
+      r.start();
+    } else recognizerRef.current = null;
     const ctx = await resumeCtx();
     let recStream: MediaStream;
     if (settings.audioMode === 'mix') {
@@ -295,10 +411,15 @@ export default function App() {
     setCursor(0);
     setLastPartner(null);
     setPhase('recording');
-    if (settings.autoFirstLine) setTimeout(() => { if (recorderRef.current?.state === 'recording') playNextPartner(); }, 1000);
+    setTurn('idle');
+    if (SCENE[0].who === 'actor') beginActorTurn();
+    else if (settings.autoFirstLine || settings.advanceMode !== 'manual') setTimeout(() => { if (recorderRef.current?.state === 'recording') playNextPartner(); }, 1000);
   };
 
   const stopRecording = () => {
+    recognizerRef.current?.stop();
+    recognizerRef.current = null;
+    setTurn('idle');
     playingRef.current?.stop();
     playingRef.current = null;
     setPartnerSpeaking(false);
@@ -401,11 +522,28 @@ export default function App() {
         <div className="badges">
           {recording && <span className="badge rec">● REC {fmt(elapsed)}</span>}
           {partnerSpeaking && <span className="badge partner">🔊 Говорит партнёр</span>}
+          {recording && turn === 'actor' && <span className="badge listen">👂 Слушаю{settings.advanceMode === 'manual' ? '' : settings.advanceMode === 'vad' || srFailed ? ' (по паузе)' : ''}</span>}
           <span className="badge mic">
             🎙 {micState}
             <span className="meter"><span style={{ width: `${Math.min(100, micLevel * 140)}%` }} /></span>
           </span>
         </div>
+        {recording && (
+          <div className="prompter">
+            {(partnerSpeaking || turn !== 'actor') && lastPartner !== null && (
+              <div className="p-partner">ПЕТЯ: {SCENE[lastPartner].text}</div>
+            )}
+            {actorLine ? (
+              <div className={`p-actor ${turn === 'actor' ? 'active' : ''}`}>
+                {actorLine.text.split(/\s+/).map((w, k) => (
+                  <span key={k} className={matched[k] && turn === 'actor' ? 'said' : ''}>{w} </span>
+                ))}
+              </div>
+            ) : cursor >= SCENE.length ? (
+              <div className="p-actor">Сцена окончена — «Стоп»</div>
+            ) : null}
+          </div>
+        )}
       </div>
 
       {error && <div className="alert error">{error}</div>}
@@ -417,6 +555,9 @@ export default function App() {
             <div className="who">ПЕТЯ (суфлёр){lastPartner !== null ? '' : ' — следующая'}</div>
             <div className="text">{lastPartner !== null ? SCENE[lastPartner].text : nextPartner !== undefined ? SCENE[nextPartner].text : '—'}</div>
           </div>
+          {recording && turn === 'actor' && heard && settings.advanceMode === 'speech' && (
+            <div className="heard">Слышу: {heard}</div>
+          )}
           <div className="line actor">
             <div className="who">МАША (вы)</div>
             <div className="text">{actorLine ? actorLine.text : cursor >= SCENE.length ? 'Сцена окончена — нажмите «Стоп»' : '…ждём реплику партнёра'}</div>
@@ -433,7 +574,10 @@ export default function App() {
         {phase === 'ready' && <button className="big rec" onClick={startRecording}>● Начать запись</button>}
         {recording && (
           <>
-            <button className="big primary" onClick={playNextPartner} disabled={nextPartner === undefined}>▶ Следующая реплика</button>
+            <button className="big primary" onClick={playNextPartner} disabled={nextPartner === undefined}>{settings.advanceMode === 'manual' ? '▶ Следующая реплика' : '▶ Следующая (вручную)'}</button>
+            <label className="field">Громкость партнёра: {Math.round(settings.partnerVolume * 100)}%
+              <input type="range" min={0.1} max={1} step={0.05} value={settings.partnerVolume} onChange={(e) => upd('partnerVolume', Number(e.target.value))} />
+            </label>
             <div className="row">
               <button onClick={repeatPartner} disabled={lastPartner === null}>↻ Повторить</button>
               <button className="stop" onClick={stopRecording}>■ Стоп</button>
@@ -455,6 +599,25 @@ export default function App() {
       <details className="panel" open={phase === 'idle'}>
         <summary>Настройки эксперимента</summary>
         <fieldset disabled={recording}>
+          <label className="field">Переход к следующей реплике партнёра
+            <select value={settings.advanceMode} onChange={(e) => upd('advanceMode', e.target.value as AdvanceMode)}>
+              <option value="speech" disabled={!speechRecognitionSupported()}>Авто: по распознаванию речи{speechRecognitionSupported() ? '' : ' (нет в этом браузере)'}</option>
+              <option value="vad">Авто: по паузе в голосе (без распознавания)</option>
+              <option value="manual">Вручную, кнопкой</option>
+            </select>
+          </label>
+          {settings.advanceMode !== 'manual' && (
+            <label className="field">Пауза перед ответом партнёра
+              <select value={settings.replyDelay} onChange={(e) => upd('replyDelay', Number(e.target.value))}>
+                <option value={0.5}>0,5 с</option>
+                <option value={1}>1 с</option>
+                <option value={2}>2 с</option>
+              </select>
+            </label>
+          )}
+          <label className="field">Громкость партнёра: {Math.round(settings.partnerVolume * 100)}%
+            <input type="range" min={0.1} max={1} step={0.05} value={settings.partnerVolume} onChange={(e) => upd('partnerVolume', Number(e.target.value))} />
+          </label>
           <label className="field">Как голос партнёра попадает в видео
             <select value={settings.audioMode} onChange={(e) => upd('audioMode', e.target.value as AudioMode)}>
               <option value="speaker">Вариант 1: динамик → микрофон</option>

@@ -69,7 +69,7 @@ export function explainGumError(e: unknown): string {
   }
 }
 
-export function speak(text: string, voiceName: string | null): { done: Promise<void>; stop: () => void } {
+export function speak(text: string, voiceName: string | null, volume = 1): { done: Promise<void>; stop: () => void } {
   if (!('speechSynthesis' in window)) {
     log('speechSynthesis недоступен', 'error');
     return { done: Promise.resolve(), stop: () => {} };
@@ -79,6 +79,7 @@ export function speak(text: string, voiceName: string | null): { done: Promise<v
   const done = new Promise<void>((res) => { finish = res; });
   const u = new SpeechSynthesisUtterance(text);
   u.lang = 'ru-RU';
+  u.volume = Math.max(0, Math.min(1, volume));
   const v = synth.getVoices().find((x) => x.name === voiceName) ?? synth.getVoices().find((x) => x.lang.toLowerCase().startsWith('ru'));
   if (v) u.voice = v;
   u.onstart = () => log(`TTS начал: "${text}" (${v?.name ?? 'голос по умолчанию'})`);
